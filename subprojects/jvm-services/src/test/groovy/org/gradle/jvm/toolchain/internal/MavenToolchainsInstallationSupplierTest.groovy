@@ -97,6 +97,32 @@ class MavenToolchainsInstallationSupplierTest extends Specification {
         useProperty << [true, false]
     }
 
+
+
+    def "supplies no installations non-xml toolchains file2"(boolean useProperty) {
+        given:
+        def toolchains = mavenHome.createFile(new File("toolchains.xml"))
+        toolchains.write('''<?xml version="1.0" encoding="UTF8"?>
+            <toolchains>
+            <toolchain>
+            <type>jdk</type>
+            <configuration>
+            <jdkHome>/usr/lib/jvm/adoptopenjdk-16.jdk</jdkHome>
+            </configuration>
+            </toolchain>
+            </toolchains>''')
+        def supplier = useProperty ? createSupplier(toolchains.getCanonicalPath(), null) : createSupplier(null, userHome)
+
+        when:
+        def directories = supplier.get()
+
+        then:
+        !directories.isEmpty()
+
+        where:
+        useProperty << [true, false]
+    }
+
     def "supplies no installations toolchains file with non-matching contents"(boolean useProperty) {
         given:
         def toolchains = mavenHome.createFile(new File("toolchains.xml"))

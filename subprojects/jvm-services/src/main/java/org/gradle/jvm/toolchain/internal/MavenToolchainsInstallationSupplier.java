@@ -92,6 +92,7 @@ public class MavenToolchainsInstallationSupplier extends AutoDetectingInstallati
                 } else {
                     LOGGER.info("Java Toolchain auto-detection failed to parse Maven Toolchains located at {}. {}", toolchainFile, e.getMessage());
                 }
+                throw new RuntimeException(e);
             }
         }
         return Collections.emptySet();
@@ -105,11 +106,12 @@ public class MavenToolchainsInstallationSupplier extends AutoDetectingInstallati
         @Override
         public void warning(SAXParseException e) throws SAXException {
             // Non-fatal error. No need to log.
+            throw e;
         }
 
         @Override
         public void error(SAXParseException e) throws SAXException {
-            // Non-fatal error. No need to log.
+            throw e;
         }
 
         @Override
