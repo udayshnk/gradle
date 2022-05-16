@@ -19,15 +19,22 @@ package org.gradle.internal.classpath;
 import org.codehaus.groovy.runtime.ProcessGroovyMethods;
 import org.codehaus.groovy.runtime.callsite.CallSite;
 import org.codehaus.groovy.runtime.callsite.CallSiteArray;
+import org.codehaus.groovy.vmplugin.v8.CacheableCallSite;
+import org.codehaus.groovy.vmplugin.v8.IndyInterface;
+import org.gradle.api.GradleException;
 import org.gradle.api.file.FileCollection;
 import org.gradle.internal.SystemProperties;
 import org.gradle.internal.classpath.intercept.CallInterceptor;
 import org.gradle.internal.classpath.intercept.ClassBoundCallInterceptor;
+import org.gradle.internal.classpath.intercept.Invocation;
 
 import javax.annotation.Nullable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
 import java.util.List;
@@ -83,26 +90,32 @@ public class Instrumented {
     }
 
     private static final Map<String, CallInterceptor> GROOVY_CALLSITE_INTERCEPTORS = new HashMap<>();
+    private static final Map<String, CallInterceptor> METHOD_INTERCEPTORS = new HashMap<>();
+    private static final Map<String, CallInterceptor> PROPERTY_INTERCEPTORS = new HashMap<>();
+    private static final CallInterceptor CONSTRUCTOR_INTERCEPTOR = new FileInputStreamConstructorInterceptor();
 
     static {
-        GROOVY_CALLSITE_INTERCEPTORS.put("getProperty", new SystemGetPropertyInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("setProperty", new SystemSetPropertyInterceptor());
+        METHOD_INTERCEPTORS.put("getProperty", new SystemGetPropertyInterceptor());
+        METHOD_INTERCEPTORS.put("setProperty", new SystemSetPropertyInterceptor());
 
         SystemGetPropertiesInterceptor getPropertiesInterceptor = new SystemGetPropertiesInterceptor();
-        GROOVY_CALLSITE_INTERCEPTORS.put("getProperties", getPropertiesInterceptor);
-        GROOVY_CALLSITE_INTERCEPTORS.put("properties", getPropertiesInterceptor);
+        METHOD_INTERCEPTORS.put("getProperties", getPropertiesInterceptor);
+        PROPERTY_INTERCEPTORS.put("properties", getPropertiesInterceptor);
 
-        GROOVY_CALLSITE_INTERCEPTORS.put("setProperties", new SystemSetPropertiesInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("clearProperty", new SystemClearPropertyInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("getInteger", new IntegerGetIntegerInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("getLong", new LongGetLongInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("getBoolean", new BooleanGetBooleanInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("getenv", new SystemGetenvInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("exec", new RuntimeExecInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("execute", new ProcessGroovyMethodsExecuteInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("start", new ProcessBuilderStartInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("startPipeline", new ProcessBuilderStartPipelineInterceptor());
-        GROOVY_CALLSITE_INTERCEPTORS.put("<$constructor$>", new FileInputStreamConstructorInterceptor());
+        METHOD_INTERCEPTORS.put("setProperties", new SystemSetPropertiesInterceptor());
+        METHOD_INTERCEPTORS.put("clearProperty", new SystemClearPropertyInterceptor());
+        METHOD_INTERCEPTORS.put("getInteger", new IntegerGetIntegerInterceptor());
+        METHOD_INTERCEPTORS.put("getLong", new LongGetLongInterceptor());
+        METHOD_INTERCEPTORS.put("getBoolean", new BooleanGetBooleanInterceptor());
+        METHOD_INTERCEPTORS.put("getenv", new SystemGetenvInterceptor());
+        METHOD_INTERCEPTORS.put("exec", new RuntimeExecInterceptor());
+        METHOD_INTERCEPTORS.put("execute", new ProcessGroovyMethodsExecuteInterceptor());
+        METHOD_INTERCEPTORS.put("start", new ProcessBuilderStartInterceptor());
+        METHOD_INTERCEPTORS.put("startPipeline", new ProcessBuilderStartPipelineInterceptor());
+
+        GROOVY_CALLSITE_INTERCEPTORS.putAll(METHOD_INTERCEPTORS);
+        GROOVY_CALLSITE_INTERCEPTORS.putAll(PROPERTY_INTERCEPTORS);
+        GROOVY_CALLSITE_INTERCEPTORS.put("<$constructor$>", CONSTRUCTOR_INTERCEPTOR);
     }
 
     // Called by generated code
@@ -114,6 +127,52 @@ public class Instrumented {
                 array.array[callSite.getIndex()] = interceptor.decorateCallSite(callSite);
             }
         }
+    }
+
+    /**
+     * The bootstrap method for method calls from Groovy compiled code with indy enabled.
+     * Gradle's bytecode processor replaces the Groovy's original {@link IndyInterface#bootstrap(MethodHandles.Lookup, String, MethodType, String, int)}
+     * with this method to intercept potentially "interesting" calls and do some additional work.
+     *
+     * @param caller the lookup for the caller (JVM-supplied)
+     * @param callType the type of the call (corresponds to {@link IndyInterface.CallType} constant)
+     * @param type the call site type
+     * @param name the real method name
+     * @param flags call flags
+     * @return the produced CallSite
+     * @see IndyInterface
+     */
+    public static java.lang.invoke.CallSite bootstrap(MethodHandles.Lookup caller, String callType, MethodType type, String name, int flags) {
+        CacheableCallSite cs = toGroovyCacheableCallSite(IndyInterface.bootstrap(caller, callType, type, name, flags));
+        switch (callType) {
+            case "invoke":
+                maybeApplyInterceptor(cs, caller, flags, METHOD_INTERCEPTORS.get(name));
+                break;
+            case "getProperty":
+                maybeApplyInterceptor(cs, caller, flags, PROPERTY_INTERCEPTORS.get(name));
+                break;
+            case "init":
+                maybeApplyInterceptor(cs, caller, flags, CONSTRUCTOR_INTERCEPTOR);
+                break;
+        }
+        return cs;
+    }
+
+    private static void maybeApplyInterceptor(CacheableCallSite cs, MethodHandles.Lookup caller, int flags, @Nullable CallInterceptor interceptor) {
+        if (interceptor == null) {
+            return;
+        }
+        MethodHandle defaultTarget = interceptor.decorateMethodHandle(cs.getDefaultTarget(), caller, flags);
+        cs.setTarget(defaultTarget);
+        cs.setDefaultTarget(defaultTarget);
+        cs.setFallbackTarget(interceptor.decorateMethodHandle(cs.getFallbackTarget(), caller, flags));
+    }
+
+    private static CacheableCallSite toGroovyCacheableCallSite(java.lang.invoke.CallSite cs) {
+        if (!(cs instanceof CacheableCallSite)) {
+            throw new GradleException("Groovy produced unrecognized call site type of " + cs.getClass());
+        }
+        return (CacheableCallSite) cs;
     }
 
     // Called by generated code.
